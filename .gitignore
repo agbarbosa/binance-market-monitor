@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime data
+/data/
+*.duckdb
+*.duckdb.wal
+*.parquet
+*.jsonl
+
+# Logs and process state
+/logs/
+*.log
+*.pid
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Temporary files
+.tmp/
+/tmp/
