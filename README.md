@@ -19,6 +19,10 @@ The MVP will **not** place orders, access account data, recommend trades, promis
 
 Watch alerts are ranking and explanation aids only. They are not probability estimates or trade recommendations.
 
+## Python version note
+
+The PRD currently states Python 3.12+ as the maintainability target. The target host for this implementation reports Python 3.11.15, so Task 1 sets package metadata to `requires-python = ">=3.11"` to keep the MVP installable and testable on the real deployment host. This is an intentional implementation adaptation to the PRD and should be revisited when the host runtime is upgraded.
+
 ## Product requirements
 
 See [docs/2026-07-16-mvp-prd.md](docs/2026-07-16-mvp-prd.md).

@@ -1,0 +1,58 @@
+[project]
+name = "binance-market-monitor"
+version = "0.1.0"
+description = "Private read-only Binance market intelligence monitor."
+readme = "README.md"
+# PRD 13.5 originally requested Python 3.12+, but the target host currently
+# provides Python 3.11.15. Task 1 intentionally relaxes this to >=3.11 so the
+# implementation can be installed, type-checked, and exercised on the host.
+requires-python = ">=3.11"
+authors = [{ name = "Alexandre Barbosa" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pydantic>=2.8,<3",
+    "pyyaml>=6.0.2,<7",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.10,<2",
+    "pytest>=8.2,<9",
+    "ruff>=0.5,<1",
+    "types-PyYAML>=6.0.12,<7",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/binance_market_monitor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["binance_market_monitor"]
+warn_unused_ignores = true
+warn_return_any = true
+no_implicit_optional = true
+plugins = ["pydantic.mypy"]
