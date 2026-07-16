@@ -3,16 +3,12 @@ name = "binance-market-monitor"
 version = "0.1.0"
 description = "Private read-only Binance market intelligence monitor."
 readme = "README.md"
-# PRD 13.5 originally requested Python 3.12+, but the target host currently
-# provides Python 3.11.15. Task 1 intentionally relaxes this to >=3.11 so the
-# implementation can be installed, type-checked, and exercised on the host.
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 authors = [{ name = "Alexandre Barbosa" }]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Financial and Insurance Industry",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Typing :: Typed",
 ]
@@ -53,14 +49,14 @@ addopts = "-ra"
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 strict = true
 packages = ["binance_market_monitor"]
 warn_unused_ignores = true

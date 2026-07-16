@@ -4,20 +4,19 @@ import asyncio
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Generic, Literal, TypeVar
+from typing import Literal
 
-T = TypeVar("T")
 QueueKind = Literal["depth", "trade"]
 
 
 @dataclass(frozen=True, slots=True)
-class QueueItem(Generic[T]):
+class QueueItem[T]:
     market: str
     symbol: str
     payload: T
 
 
-class BoundedMarketQueue(Generic[T]):
+class BoundedMarketQueue[T]:
     """Bounded async queue with explicit market-data overflow semantics."""
 
     def __init__(

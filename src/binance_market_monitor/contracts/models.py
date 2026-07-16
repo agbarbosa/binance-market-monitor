@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, ClassVar, Final, Literal, TypeAlias
+from typing import Annotated, ClassVar, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, PlainSerializer, PositiveInt
 
 SCHEMA_VERSION: Final[Literal["1.0"]] = "1.0"
 PRODUCT_NAME: Final[Literal["binance_market_monitor"]] = "binance_market_monitor"
 
-Market: TypeAlias = Literal["spot", "usd_m_futures"]
-BookState: TypeAlias = Literal["warming", "valid", "stale", "invalid", "resync_pending"]
-AlertType: TypeAlias = Literal[
+type Market = Literal["spot", "usd_m_futures"]
+type BookState = Literal["warming", "valid", "stale", "invalid", "resync_pending"]
+type AlertType = Literal[
     "spot_led_momentum_watch",
     "breakout_retest_watch",
     "liquidity_sweep_recovery_watch",
@@ -21,25 +21,25 @@ AlertType: TypeAlias = Literal[
     "data_quality_warning",
     "system_health_alert",
 ]
-Severity: TypeAlias = Literal["low", "medium", "high", "critical"]
-EvidenceConfidence: TypeAlias = Literal["low", "medium", "medium_high", "high"]
-HealthStatus: TypeAlias = Literal["healthy", "degraded", "stale", "blocked", "unavailable"]
-ReviewStatus: TypeAlias = Literal["useful", "noisy", "late", "misleading", "unreviewed"]
-AggressorSide: TypeAlias = Literal["buyer_initiated", "seller_initiated", "unknown"]
+type Severity = Literal["low", "medium", "high", "critical"]
+type EvidenceConfidence = Literal["low", "medium", "medium_high", "high"]
+type HealthStatus = Literal["healthy", "degraded", "stale", "blocked", "unavailable"]
+type ReviewStatus = Literal["useful", "noisy", "late", "misleading", "unreviewed"]
+type AggressorSide = Literal["buyer_initiated", "seller_initiated", "unknown"]
 
 
 def _decimal_to_string(value: Decimal) -> str:
     return str(value)
 
 
-DecimalString: TypeAlias = Annotated[
+type DecimalString = Annotated[
     Decimal,
     PlainSerializer(_decimal_to_string, return_type=str, when_used="json"),
 ]
-DepthLevel: TypeAlias = tuple[DecimalString, DecimalString]
-MetricValue: TypeAlias = str | int | float | bool | None
-MetricMap: TypeAlias = dict[str, MetricValue]
-NestedMetricMap: TypeAlias = dict[str, MetricValue | MetricMap]
+type DepthLevel = tuple[DecimalString, DecimalString]
+type MetricValue = str | int | float | bool | None
+type MetricMap = dict[str, MetricValue]
+type NestedMetricMap = dict[str, MetricValue | MetricMap]
 
 
 class ContractBase(BaseModel):

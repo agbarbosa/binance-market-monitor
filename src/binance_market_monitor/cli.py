@@ -24,6 +24,7 @@ from binance_market_monitor.runtime.transports import (
 )
 
 cli = typer.Typer(help="Read-only Binance market monitor operations.")
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 @cli.command()
@@ -47,8 +48,7 @@ def server(
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(8000, "--port"),
 ) -> None:
-    if host not in {"127.0.0.1", "localhost", "::1"}:
-        raise typer.BadParameter("default server command is localhost-only")
+    _require_loopback_host(host, context="server command")
     state = build_app_state()
     state.bind_host = host
     uvicorn.run(create_app(state), host=host, port=port)
@@ -60,11 +60,32 @@ def monitor(
         Path("configs/config.example.yaml"), "--config", exists=True
     ),
     bounded: bool = typer.Option(False, "--bounded", help="Run one bounded cycle and exit."),
+    serve_api: bool | None = typer.Option(
+        None,
+        "--serve-api/--no-serve-api",
+        help=(
+            "Serve the read-only FastAPI over the collector's live ApiState. "
+            "Defaults on for continuous monitor and off for --bounded."
+        ),
+    ),
+    api_host: str | None = typer.Option(
+        None,
+        "--api-host",
+        help="Loopback host for the monitor-owned API server; defaults to config api.bind_host.",
+    ),
+    api_port: int | None = typer.Option(
+        None,
+        "--api-port",
+        min=1,
+        max=65_535,
+        help="Port for the monitor-owned API server; defaults to config api.bind_port.",
+    ),
     broad_messages: int | None = typer.Option(None, "--broad-messages", min=0),
     deep_messages: int | None = typer.Option(None, "--deep-messages", min=0),
     futures: bool | None = typer.Option(None, "--futures/--no-futures"),
 ) -> None:
     app_config = AppConfig.from_yaml(config)
+    app_config = _with_api_overrides(app_config, host=api_host, port=api_port)
     runtime = runtime_config_from_app(app_config)
     has_runtime_overrides = (
         broad_messages is not None
@@ -100,9 +121,15 @@ def monitor(
             stage1_evaluation_interval_seconds=runtime.stage1_evaluation_interval_seconds,
             stage2_evaluation_interval_seconds=runtime.stage2_evaluation_interval_seconds,
         )
-    if app_config.api.bind_host not in {"127.0.0.1", "localhost", "::1"}:
-        raise typer.BadParameter("monitor defaults to localhost-only API bind")
-    result = asyncio.run(_run_monitor(app_config, runtime, bounded=bounded))
+    _require_loopback_host(app_config.api.bind_host, context="monitor API")
+    result = asyncio.run(
+        _run_monitor(
+            app_config,
+            runtime,
+            bounded=bounded,
+            serve_api=_resolve_monitor_api_enabled(bounded=bounded, serve_api=serve_api),
+        )
+    )
     typer.echo(
         " ".join(
             [
@@ -116,25 +143,56 @@ def monitor(
     )
 
 
+def _resolve_monitor_api_enabled(*, bounded: bool, serve_api: bool | None) -> bool:
+    if serve_api is not None:
+        return serve_api
+    return not bounded
+
+
+def _with_api_overrides(
+    app_config: AppConfig, *, host: str | None, port: int | None
+) -> AppConfig:
+    if host is None and port is None:
+        return app_config
+    api_config = app_config.api.model_copy(
+        update={
+            key: value
+            for key, value in {"bind_host": host, "bind_port": port}.items()
+            if value is not None
+        }
+    )
+    return app_config.model_copy(update={"api": api_config})
+
+
+def _require_loopback_host(host: str, *, context: str) -> None:
+    if host not in _LOOPBACK_HOSTS:
+        raise typer.BadParameter(f"{context} is localhost-only")
+
+
 async def _run_monitor(
-    app_config: AppConfig, runtime: LiveRuntimeConfig, *, bounded: bool
+    app_config: AppConfig,
+    runtime: LiveRuntimeConfig,
+    *,
+    bounded: bool,
+    serve_api: bool,
 ) -> LiveRunResult:
     rest = AsyncHttpxJsonRestTransport()
     spot_stream = AsyncWebsocketsJsonStreamTransport()
     futures_stream = AsyncWebsocketsJsonStreamTransport()
     futures_rpc = AsyncWebsocketsJsonRpcTransport()
+    api_state = ApiState(
+        bind_host=app_config.api.bind_host,
+        storage_path=app_config.storage.base_path,
+        webhook_url=(
+            app_config.webhook.url.get_secret_value()
+            if app_config.webhook.url is not None
+            else None
+        ),
+    )
     engine = LiveMonitorEngine(
         app_config=app_config,
         runtime_config=runtime,
-        api_state=ApiState(
-            bind_host=app_config.api.bind_host,
-            storage_path=app_config.storage.base_path,
-            webhook_url=(
-                app_config.webhook.url.get_secret_value()
-                if app_config.webhook.url is not None
-                else None
-            ),
-        ),
+        api_state=api_state,
         rest_transport=rest,
         spot_stream_transport=spot_stream,
         futures_stream_transport=futures_stream,
@@ -142,12 +200,49 @@ async def _run_monitor(
         webhook_transport=rest,
     )
     try:
+        if serve_api:
+            return await _run_engine_with_api(engine, app_config, bounded=bounded)
         if bounded:
             return await engine.run_bounded()
         return await engine.run_forever()
     finally:
         await engine.shutdown()
         await rest.aclose()
+
+
+async def _run_engine_with_api(
+    engine: LiveMonitorEngine, app_config: AppConfig, *, bounded: bool
+) -> LiveRunResult:
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_app(engine.api_state),
+            host=app_config.api.bind_host,
+            port=app_config.api.bind_port,
+            log_level=app_config.logging.level.lower(),
+        )
+    )
+    server_task = asyncio.create_task(server.serve())
+    engine_task = asyncio.create_task(engine.run_bounded() if bounded else engine.run_forever())
+    try:
+        done, _ = await asyncio.wait(
+            {engine_task, server_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if engine_task in done:
+            return await engine_task
+        await server_task
+        raise RuntimeError("monitor API server stopped before collector completed")
+    finally:
+        if not engine_task.done():
+            engine_task.cancel()
+            await asyncio.gather(engine_task, return_exceptions=True)
+        server.should_exit = True
+        if not server_task.done():
+            try:
+                await asyncio.wait_for(server_task, timeout=5)
+            except TimeoutError:
+                server_task.cancel()
+                await asyncio.gather(server_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

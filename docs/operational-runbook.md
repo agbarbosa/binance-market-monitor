@@ -1,9 +1,17 @@
 # Operational Runbook
 
-## Start API locally
+## Start functional monitor and API locally
+
+Use the `monitor` command rather than a standalone `uvicorn` process so the read-only API observes the same live `ApiState` updated by the collector:
 
 ```bash
-uv run uvicorn binance_market_monitor.app:app --host 127.0.0.1 --port 8000
+uv run --python 3.12 binance-market-monitor monitor --config configs/config.example.yaml --serve-api
+```
+
+For bounded smoke tests, omit `--serve-api` to run one collector cycle and exit without a lingering server:
+
+```bash
+uv run --python 3.12 binance-market-monitor monitor --config configs/config.example.yaml --bounded --broad-messages 5 --deep-messages 1 --no-futures
 ```
 
 ## Health checks
@@ -16,7 +24,7 @@ uv run uvicorn binance_market_monitor.app:app --host 127.0.0.1 --port 8000
 ## Replay
 
 ```bash
-uv run binance-market-monitor replay path/to/events.jsonl
+uv run --python 3.12 binance-market-monitor replay path/to/events.jsonl
 ```
 
 Replay counts corrupt events, duplicate diffs, and gap invalidations without requiring live network access.
@@ -26,7 +34,7 @@ Replay counts corrupt events, duplicate diffs, and gap invalidations without req
 Connectivity is opt-in and no-auth:
 
 ```bash
-uv run python scripts/check_connectivity.py --live --timeout 5
+uv run --python 3.12 python scripts/check_connectivity.py --live --timeout 5
 ```
 
 ## Security constraints
