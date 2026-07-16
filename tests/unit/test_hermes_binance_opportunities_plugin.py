@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 from collections.abc import Iterator
@@ -141,6 +143,42 @@ def test_register_wires_single_hermes_tool() -> None:
     assert registered["toolset"] == "binance_opportunities"
     assert registered["schema"]["name"] == "binance_opportunities_list"
     assert callable(registered["handler"])
+
+
+def test_plugin_loads_as_standalone_package_outside_repository(tmp_path: Path) -> None:
+    """Hermes loads personal plugins from their own directory, not the repository package."""
+    source = REPO_ROOT / "integrations/hermes_plugins/binance_opportunities"
+    plugin_dir = tmp_path / "binance-opportunities"
+    shutil.copytree(source, plugin_dir)
+    script = """
+import importlib.util
+import pathlib
+import sys
+
+plugin_dir = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location(
+    "standalone_binance_opportunities",
+    plugin_dir / "__init__.py",
+    submodule_search_locations=[str(plugin_dir)],
+)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+calls = []
+class FakeContext:
+    def register_tool(self, **kwargs):
+        calls.append(kwargs)
+module.register(FakeContext())
+assert calls[0]["name"] == "binance_opportunities_list"
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(plugin_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_consolidates_candidate_with_most_recent_alert_and_dedupes_reason_codes(

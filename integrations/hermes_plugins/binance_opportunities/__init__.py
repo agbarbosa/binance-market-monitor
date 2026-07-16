@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-from integrations.hermes_plugins.binance_opportunities.schemas import (
-    BINANCE_OPPORTUNITIES_LIST_SCHEMA,
-)
-from integrations.hermes_plugins.binance_opportunities.tools import (
-    handle_binance_opportunities_list,
-)
+from .schemas import BINANCE_OPPORTUNITIES_LIST_SCHEMA
+from .tools import handle_binance_opportunities_list
 
 
 def register(ctx) -> None:
