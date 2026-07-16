@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -81,6 +81,8 @@ class LiveRuntimeConfig:
     snapshot_limit: int = 100
     max_universe_symbols: int = 200
     api_bind_host: str = "127.0.0.1"
+    stage1_evaluation_interval_seconds: float = 1.0
+    stage2_evaluation_interval_seconds: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,7 +188,8 @@ class LiveMonitorEngine:
         self._shutdown = False
         self._processed_messages = 0
         self._storage_rows_written = 0
-        self._tasks: set[asyncio.Task[object]] = set()
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._stream_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
         self._update_health("initialized")
 
     async def run_bounded(self) -> LiveRunResult:
@@ -212,12 +215,23 @@ class LiveMonitorEngine:
         stop = stop_event or asyncio.Event()
         self._update_health("starting")
         await self.bootstrap()
-        while not stop.is_set() and not self._shutdown:
-            result = await self.run_bounded()
-            await asyncio.sleep(1)
-            if self.runtime_config.broad_stream_message_limit is not None:
-                return result
-        await self.shutdown()
+        self._start_broad_spot_tasks()
+        self._update_health("running")
+        try:
+            while not stop.is_set() and not self._shutdown:
+                candidates = await self.evaluate_stage1()
+                self._set_deep_symbols(candidates)
+                self._reconcile_spot_deep_tasks()
+                if self.runtime_config.futures_enabled:
+                    self._reconcile_futures_tasks(candidates)
+                await self.evaluate_stage2(candidates)
+                interval_seconds = min(
+                    self.runtime_config.stage1_evaluation_interval_seconds,
+                    self.runtime_config.stage2_evaluation_interval_seconds,
+                )
+                await _sleep_until_stop(stop, interval_seconds)
+        finally:
+            await self.shutdown()
         return LiveRunResult(
             shutdown_reason="stopped",
             processed_messages=self._processed_messages,
@@ -253,11 +267,40 @@ class LiveMonitorEngine:
         spot_urls = SpotWebSocketURLBuilder()
         mini_url = spot_urls.raw_stream("!miniTicker@arr")
         book_url = spot_urls.raw_stream("!bookTicker")
-        await self._consume_stream(
-            mini_url, self._handle_spot_mini_ticker, self.spot_stream_transport
+        await asyncio.gather(
+            self._consume_stream(
+                mini_url,
+                self._handle_spot_mini_ticker,
+                self.spot_stream_transport,
+                max_messages=self.runtime_config.broad_stream_message_limit,
+            ),
+            self._consume_stream(
+                book_url,
+                self._handle_spot_book_ticker,
+                self.spot_stream_transport,
+                max_messages=self.runtime_config.broad_stream_message_limit,
+            ),
         )
-        await self._consume_stream(
-            book_url, self._handle_spot_book_ticker, self.spot_stream_transport
+
+    def _start_broad_spot_tasks(self) -> None:
+        spot_urls = SpotWebSocketURLBuilder()
+        self._ensure_stream_task(
+            ("spot_broad", "mini_ticker"),
+            self._consume_stream(
+                spot_urls.raw_stream("!miniTicker@arr"),
+                self._handle_spot_mini_ticker,
+                self.spot_stream_transport,
+                max_messages=None,
+            ),
+        )
+        self._ensure_stream_task(
+            ("spot_broad", "book_ticker"),
+            self._consume_stream(
+                spot_urls.raw_stream("!bookTicker"),
+                self._handle_spot_book_ticker,
+                self.spot_stream_transport,
+                max_messages=None,
+            ),
         )
 
     async def evaluate_stage1(self) -> list[Stage1CandidateRecord]:
@@ -295,22 +338,66 @@ class LiveMonitorEngine:
         return ranked
 
     async def consume_deep_spot_streams(self) -> None:
+        tasks: list[asyncio.Task[Any]] = []
         for symbol in self.deep_symbols:
-            await self._sync_spot_book(symbol)
-            await self._consume_symbol_trades(symbol)
+            tasks.extend(
+                [
+                    asyncio.create_task(self._sync_spot_book(symbol)),
+                    asyncio.create_task(self._consume_symbol_trades(symbol)),
+                    asyncio.create_task(self._consume_symbol_book_ticker(symbol)),
+                    asyncio.create_task(self._consume_symbol_closed_klines(symbol)),
+                ]
+            )
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    def _reconcile_spot_deep_tasks(self) -> None:
+        for symbol in self.deep_symbols:
+            self._ensure_stream_task(("spot_depth", symbol), self._sync_spot_book(symbol))
+            self._ensure_stream_task(("spot_trade", symbol), self._consume_symbol_trades(symbol))
+            self._ensure_stream_task(
+                ("spot_book_ticker", symbol), self._consume_symbol_book_ticker(symbol)
+            )
+            self._ensure_stream_task(
+                ("spot_kline_closed", symbol), self._consume_symbol_closed_klines(symbol)
+            )
 
     async def consume_futures_context(self, candidates: list[Stage1CandidateRecord]) -> None:
         if self.futures_stream_transport is None:
             for candidate in candidates:
                 self.futures[candidate.symbol].degraded = True
             return
-        for candidate in candidates:
-            try:
-                await self._sync_futures_book(candidate.symbol)
-                await self._consume_futures_trade(candidate.symbol)
-                await self._consume_futures_mark_price(candidate.symbol)
-            except Exception:  # noqa: BLE001 - optional Futures context degrades safely.
+        await asyncio.gather(
+            *(
+                self._consume_futures_context_for_symbol(candidate.symbol)
+                for candidate in candidates
+            )
+        )
+
+    def _reconcile_futures_tasks(self, candidates: list[Stage1CandidateRecord]) -> None:
+        if self.futures_stream_transport is None:
+            for candidate in candidates:
                 self.futures[candidate.symbol].degraded = True
+            return
+        for candidate in candidates:
+            symbol = candidate.symbol
+            self._ensure_stream_task(
+                ("futures_context", symbol), self._consume_futures_context_for_symbol(symbol)
+            )
+
+    async def _consume_futures_context_for_symbol(self, symbol: str) -> None:
+        tasks = [
+            asyncio.create_task(self._sync_futures_book(symbol)),
+            asyncio.create_task(self._consume_futures_trade(symbol)),
+            asyncio.create_task(self._consume_futures_mark_price(symbol)),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except Exception:  # noqa: BLE001 - optional Futures context degrades safely.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self.futures[symbol].degraded = True
 
     async def evaluate_stage2(self, candidates: list[Stage1CandidateRecord]) -> None:
         rows: list[dict[str, object]] = []
@@ -386,15 +473,16 @@ class LiveMonitorEngine:
         url: str,
         handler: Callable[[dict[str, Any]], None],
         transport: StreamTransport,
+        *,
+        max_messages: int | None,
     ) -> None:
         async for message in transport.stream_json(
             url,
             self.runtime_config.ws_timeout_seconds,
-            max_messages=self.runtime_config.broad_stream_message_limit,
+            max_messages=max_messages,
         ):
             handler(message)
-            self._processed_messages += 1
-            self._update_metrics()
+            self._record_processed_message()
 
     def _handle_spot_mini_ticker(self, message: dict[str, Any]) -> None:
         payload = message.get("data", message)
@@ -434,13 +522,42 @@ class LiveMonitorEngine:
             return
         self.book_tickers[symbol] = _BookTicker(bid, bid_qty, ask, ask_qty)
 
+    def _handle_spot_closed_kline(self, message: dict[str, Any]) -> None:
+        payload = message.get("data", message)
+        if not isinstance(payload, dict):
+            return
+        kline = payload.get("k")
+        if not isinstance(kline, dict) or not bool(kline.get("x")):
+            return
+        symbol = str(kline.get("s") or payload.get("s") or "").upper()
+        if symbol not in self.universe and symbol != "BTCUSDT":
+            return
+        price = _decimal(kline.get("c"))
+        volume = _decimal(kline.get("q") or kline.get("v"))
+        if price is None or volume is None:
+            return
+        trade_count = int(_decimal(kline.get("n")) or 0)
+        self.histories[symbol].append(
+            MarketSample(
+                timestamp=_event_time(payload, self._now()),
+                symbol=symbol,
+                price=price,
+                volume=volume,
+                trade_count=trade_count,
+            )
+        )
+
     def _set_deep_symbols(self, candidates: list[Stage1CandidateRecord]) -> None:
         symbols = [symbol.upper() for symbol in self.app_config.universe.permanent_deep_symbols]
         symbols.extend(candidate.symbol for candidate in candidates)
         self.deep_symbols = list(dict.fromkeys(symbols))
 
     async def _sync_spot_book(self, symbol: str) -> None:
-        book = self.spot_books.setdefault(symbol, LocalOrderBook(market="spot", symbol=symbol))
+        book = self.spot_books.get(symbol)
+        if book is None or book.state != "warming" and not book.is_valid:
+            book = LocalOrderBook(market="spot", symbol=symbol)
+            self.spot_books[symbol] = book
+        self.api_state.books[("spot", symbol)] = book
         urls = SpotWebSocketURLBuilder()
         stream_url = urls.single_stream(symbol, "depth@100ms")
         async for message in self.spot_stream_transport.stream_json(
@@ -449,13 +566,24 @@ class LiveMonitorEngine:
             max_messages=self.runtime_config.deep_stream_message_limit,
         ):
             diff = _spot_depth_diff(message, now=self._now())
-            if diff is not None:
+            if diff is None:
+                continue
+            if book.state == "warming":
                 book.buffer_diff(diff)
-                await self.depth_queue.put(
-                    QueueItem("spot", symbol, cast(dict[str, Any], message.get("data", message)))
-                )
-                self._processed_messages += 1
-                break
+                await self._record_depth_queue_item("spot", symbol, message)
+                self._record_processed_message()
+                await self._apply_spot_snapshot(symbol, book)
+                continue
+            book.apply_diff(diff)
+            await self._record_depth_queue_item("spot", symbol, message)
+            self._record_processed_message()
+            if not book.is_valid:
+                book = LocalOrderBook(market="spot", symbol=symbol)
+                self.spot_books[symbol] = book
+                self.api_state.books[("spot", symbol)] = book
+                continue
+
+    async def _apply_spot_snapshot(self, symbol: str, book: LocalOrderBook) -> None:
         snapshot_payload = await self.spot_rest.depth_snapshot(
             symbol, self.runtime_config.snapshot_limit
         )
@@ -473,17 +601,41 @@ class LiveMonitorEngine:
             trade = _trade_from_agg(message, market="spot", now=self._now())
             if trade is not None:
                 self.trades[symbol].append(trade)
-                await self.trade_queue.put(
-                    QueueItem("spot", symbol, cast(dict[str, Any], message.get("data", message)))
-                )
-                self._processed_messages += 1
+                await self._record_trade_queue_item("spot", symbol, message)
+                self._record_processed_message()
+
+    async def _consume_symbol_book_ticker(self, symbol: str) -> None:
+        urls = SpotWebSocketURLBuilder()
+        stream_url = urls.single_stream(symbol, "bookTicker")
+        async for message in self.spot_stream_transport.stream_json(
+            stream_url,
+            self.runtime_config.ws_timeout_seconds,
+            max_messages=self.runtime_config.deep_stream_message_limit,
+        ):
+            self._handle_spot_book_ticker(message)
+            self._record_processed_message()
+
+    async def _consume_symbol_closed_klines(self, symbol: str) -> None:
+        urls = SpotWebSocketURLBuilder()
+        stream_url = urls.single_stream(symbol, "kline_1m")
+        async for message in self.spot_stream_transport.stream_json(
+            stream_url,
+            self.runtime_config.ws_timeout_seconds,
+            max_messages=self.runtime_config.deep_stream_message_limit,
+        ):
+            self._handle_spot_closed_kline(message)
+            self._record_processed_message()
 
     async def _sync_futures_book(self, symbol: str) -> None:
         if self.futures_snapshot is None or self.futures_stream_transport is None:
             self.futures[symbol].degraded = True
             return
         state = self.futures[symbol]
-        book = state.book or LocalOrderBook(market="usd_m_futures", symbol=symbol)
+        book = state.book
+        if book is None or book.state != "warming" and not book.is_valid:
+            book = LocalOrderBook(market="usd_m_futures", symbol=symbol)
+            state.book = book
+        self.api_state.books[("usd_m_futures", symbol)] = book
         urls = FuturesWebSocketURLBuilder()
         stream_url = urls.single_stream(FuturesStreamRoute.PUBLIC, f"{symbol.lower()}@depth@100ms")
         async for message in self.futures_stream_transport.stream_json(
@@ -492,10 +644,25 @@ class LiveMonitorEngine:
             max_messages=self.runtime_config.deep_stream_message_limit,
         ):
             diff = _futures_depth_diff(message, now=self._now())
-            if diff is not None:
+            if diff is None:
+                continue
+            if book.state == "warming":
                 book.buffer_diff(diff)
-                self._processed_messages += 1
-                break
+                self._record_processed_message()
+                await self._apply_futures_snapshot(symbol, book)
+                continue
+            book.apply_diff(diff)
+            self._record_processed_message()
+            if not book.is_valid:
+                book = LocalOrderBook(market="usd_m_futures", symbol=symbol)
+                state.book = book
+                self.api_state.books[("usd_m_futures", symbol)] = book
+                continue
+
+    async def _apply_futures_snapshot(self, symbol: str, book: LocalOrderBook) -> None:
+        if self.futures_snapshot is None:
+            self.futures[symbol].degraded = True
+            return
         response = await self.futures_snapshot.depth_snapshot(
             symbol, self.runtime_config.snapshot_limit
         )
@@ -503,7 +670,7 @@ class LiveMonitorEngine:
         if not isinstance(result, dict):
             raise BinanceConnectorError("Futures snapshot response missing result object")
         book.apply_snapshot(_depth_snapshot_from_payload(result))
-        state.book = book
+        self.futures[symbol].book = book
         self.api_state.books[("usd_m_futures", symbol)] = book
 
     async def _consume_futures_trade(self, symbol: str) -> None:
@@ -519,8 +686,7 @@ class LiveMonitorEngine:
             trade = _trade_from_agg(message, market="usd_m_futures", now=self._now())
             if trade is not None:
                 self.futures_trades[symbol].append(trade)
-                self._processed_messages += 1
-            break
+                self._record_processed_message()
 
     async def _consume_futures_mark_price(self, symbol: str) -> None:
         if self.futures_stream_transport is None:
@@ -536,8 +702,7 @@ class LiveMonitorEngine:
             if isinstance(payload, dict):
                 self.futures[symbol].mark_price = _decimal(payload.get("p"))
                 self.futures[symbol].funding_rate = _decimal(payload.get("r"))
-                self._processed_messages += 1
-            break
+                self._record_processed_message()
 
     def _futures_context(self, symbol: str) -> FuturesContext | None:
         state = self.futures.get(symbol)
@@ -555,6 +720,48 @@ class LiveMonitorEngine:
             bid_depth_notional=bid_depth,
             ask_depth_notional=ask_depth,
         )
+
+    def _ensure_stream_task(
+        self, key: tuple[str, str], coro: Coroutine[Any, Any, None]
+    ) -> None:
+        existing = self._stream_tasks.get(key)
+        if existing is not None and not existing.done():
+            coro.close()
+            return
+        task = asyncio.create_task(coro)
+        self._stream_tasks[key] = task
+        self._tasks.add(task)
+
+        def _discard(done_task: asyncio.Task[Any]) -> None:
+            self._tasks.discard(done_task)
+            if self._stream_tasks.get(key) is done_task:
+                self._stream_tasks.pop(key, None)
+            if not done_task.cancelled() and done_task.exception() is not None:
+                self.api_state.health["last_stream_error"] = str(done_task.exception())
+
+        task.add_done_callback(_discard)
+
+    async def _record_depth_queue_item(
+        self, market: str, symbol: str, message: dict[str, Any]
+    ) -> None:
+        accepted = await self.depth_queue.put(
+            QueueItem(market, symbol, cast(dict[str, Any], message.get("data", message)))
+        )
+        if accepted:
+            await self.depth_queue.get()
+
+    async def _record_trade_queue_item(
+        self, market: str, symbol: str, message: dict[str, Any]
+    ) -> None:
+        accepted = await self.trade_queue.put(
+            QueueItem(market, symbol, cast(dict[str, Any], message.get("data", message)))
+        )
+        if accepted:
+            await self.trade_queue.get()
+
+    def _record_processed_message(self) -> None:
+        self._processed_messages += 1
+        self._update_metrics()
 
     def _write_rows(self, table: str, rows: list[dict[str, object]]) -> None:
         if not rows:
@@ -620,6 +827,13 @@ async def _get_json_value(transport: RestTransport, url: str, timeout_seconds: f
     if method is not None:
         return await cast(Any, method)(url, timeout_seconds)
     return await transport.get_json(url, timeout_seconds)
+
+
+async def _sleep_until_stop(stop: asyncio.Event, seconds: float) -> None:
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=seconds)
+    except TimeoutError:
+        return
 
 
 def _parse_ticker_volumes(raw: object) -> dict[str, Decimal]:
@@ -802,6 +1016,8 @@ def runtime_config_from_app(app_config: AppConfig) -> LiveRuntimeConfig:
         snapshot_limit=runtime.snapshot_limit,
         max_universe_symbols=runtime.max_universe_symbols,
         api_bind_host=app_config.api.bind_host,
+        stage1_evaluation_interval_seconds=runtime.stage1_evaluation_interval_seconds,
+        stage2_evaluation_interval_seconds=runtime.stage2_evaluation_interval_seconds,
     )
 
 

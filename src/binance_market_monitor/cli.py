@@ -97,6 +97,8 @@ def monitor(
             snapshot_limit=runtime.snapshot_limit,
             max_universe_symbols=runtime.max_universe_symbols,
             api_bind_host=app_config.api.bind_host,
+            stage1_evaluation_interval_seconds=runtime.stage1_evaluation_interval_seconds,
+            stage2_evaluation_interval_seconds=runtime.stage2_evaluation_interval_seconds,
         )
     if app_config.api.bind_host not in {"127.0.0.1", "localhost", "::1"}:
         raise typer.BadParameter("monitor defaults to localhost-only API bind")

@@ -86,6 +86,8 @@ class RuntimeConfig(StrictBaseModel):
     warmup_min_trades: int = Field(default=3, ge=0)
     snapshot_limit: int = Field(default=100, gt=0)
     max_universe_symbols: int = Field(default=200, gt=0)
+    stage1_evaluation_interval_seconds: float = Field(default=1.0, gt=0)
+    stage2_evaluation_interval_seconds: float = Field(default=1.0, gt=0)
 
 
 class ApiConfig(StrictBaseModel):
