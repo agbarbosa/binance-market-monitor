@@ -22,11 +22,16 @@ def test_project_requires_python_312_everywhere() -> None:
     assert "python:3.11" not in dockerfile
 
 
-def test_compose_runs_functional_monitor_and_publishes_loopback_only() -> None:
+def test_compose_runs_functional_monitor_on_host_loopback_with_persistent_data() -> None:
     compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
     service = compose["services"]["binance-market-monitor"]
 
-    assert service["ports"] == ["127.0.0.1:8000:8000"]
+    # Host networking lets the process keep its strict 127.0.0.1 bind while
+    # making that loopback API reachable by the host-side Hermes plugin.
+    assert service["network_mode"] == "host"
+    assert "ports" not in service
+    assert service["restart"] == "unless-stopped"
+    assert "./data:/app/data" in service["volumes"]
     assert service["command"][:4] == [
         "uv",
         "run",
