@@ -18,6 +18,9 @@ universe:
   denied_symbols: [BUSDUSDT]
   permanent_deep_symbols: [BTCUSDT, ETHUSDT]
   max_dynamic_candidates: 7
+  min_quote_volume_usdt: "25000000"
+  min_history_minutes: 120
+  min_listing_age_days: 14
 stage1:
   min_quote_volume_usdt: "25000000"
   min_relative_volume_5m: 2.5
@@ -59,6 +62,9 @@ api:
     assert config.universe.eligible_quote_assets == ("USDT",)
     assert config.universe.permanent_deep_symbols == ("BTCUSDT", "ETHUSDT")
     assert config.universe.max_dynamic_candidates == 7
+    assert config.universe.min_quote_volume_usdt == "25000000"
+    assert config.universe.min_history_minutes == 120
+    assert config.universe.min_listing_age_days == 14
     assert config.stage1.min_quote_volume_usdt == "25000000"
     assert config.features.windows == ("1m", "5m", "15m", "1h")
     assert config.webhook.url == SecretStr("https://n8n.example.invalid/webhook/private-token")

@@ -21,6 +21,9 @@ class UniverseConfig(StrictBaseModel):
     denied_symbols: tuple[str, ...] = ()
     permanent_deep_symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
     max_dynamic_candidates: int = Field(default=20, ge=0)
+    min_quote_volume_usdt: str = "10000000"
+    min_history_minutes: int = Field(default=60, ge=0)
+    min_listing_age_days: int = Field(default=7, ge=0)
 
 
 class Stage1Config(StrictBaseModel):

@@ -12,6 +12,9 @@ universe:
     - "BTCUSDT"
     - "ETHUSDT"
   max_dynamic_candidates: 20
+  min_quote_volume_usdt: "10000000"
+  min_history_minutes: 60
+  min_listing_age_days: 7
 
 stage1:
   min_quote_volume_usdt: "10000000"
