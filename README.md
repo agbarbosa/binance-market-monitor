@@ -1,53 +1,21 @@
 # Binance Market Monitor
 
-Private, read-only market intelligence monitor for detecting and explaining unusual market conditions worth manual review.
+Read-only Binance public market monitor MVP. The service reconstructs local books, scans public market data, emits neutral watch alerts, stores Parquet ZSTD partitions, supports deterministic offline replay, and exposes a localhost FastAPI API.
 
-## Product status
+Safety guardrails:
 
-**Status:** PRD / pre-implementation
+- No account, credential, signed, order execution, proxy, VPN, or Open Interest inference code.
+- Default API bind host is `127.0.0.1`.
+- Standard Binance production account/API hosts are not required for runtime tests.
+- Live connectivity check is opt-in: `uv run python scripts/check_connectivity.py --live`.
 
-The MVP will:
+Common commands:
 
-- scan the active Binance Spot `USDT` universe using public market data;
-- dynamically deep-analyze the strongest candidates;
-- use USD-M Futures public streams as optional contextual alignment;
-- produce explainable **watch alerts** through n8n and Telegram;
-- persist replayable data in Parquet and query it with DuckDB;
-- run without Binance credentials or trading permissions.
-
-The MVP will **not** place orders, access account data, recommend trades, promise returns, or bypass Binance geographic restrictions.
-
-Watch alerts are ranking and explanation aids only. They are not probability estimates or trade recommendations.
-
-## Python version note
-
-The PRD currently states Python 3.12+ as the maintainability target. The target host for this implementation reports Python 3.11.15, so Task 1 sets package metadata to `requires-python = ">=3.11"` to keep the MVP installable and testable on the real deployment host. This is an intentional implementation adaptation to the PRD and should be revisited when the host runtime is upgraded.
-
-## Product requirements
-
-See [docs/2026-07-16-mvp-prd.md](docs/2026-07-16-mvp-prd.md).
-
-## Verified VPS connectivity
-
-Verified on `2026-07-16`:
-
-- Spot market-data-only REST: working (`data-api.binance.vision`)
-- Spot market-data-only WebSocket: working (`data-stream.binance.vision`)
-- Spot depth snapshot through market-data-only REST: working
-- USD-M Futures split WebSocket routes: working
-- USD-M Futures WebSocket API depth snapshot: working
-- Standard Binance Spot and Futures REST: HTTP `451`
-
-The implementation must use only officially documented, legally available endpoints and degrade safely when a source is unavailable.
-
-See the [2026-07-16 connectivity verification record](docs/2026-07-16-connectivity-verification.md) for the tested routes and limitations.
-
-## Repository workflow
-
-All changes follow:
-
-```text
-branch → pull request → manual approval
+```bash
+uv run pytest -q
+uv run ruff check .
+uv run mypy src
+uv run binance-market-monitor schema --output schemas
+uv run binance-market-monitor replay fixtures/events.jsonl
+uv run uvicorn binance_market_monitor.app:app --host 127.0.0.1 --port 8000
 ```
-
-No automatic merge and no direct feature commits to `main`.

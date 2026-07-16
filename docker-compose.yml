@@ -1,0 +1,8 @@
+services:
+  binance-market-monitor:
+    build: .
+    environment:
+      BMM_BIND_HOST: 127.0.0.1
+    ports:
+      - "127.0.0.1:8000:8000"
+    command: ["uv", "run", "uvicorn", "binance_market_monitor.app:app", "--host", "127.0.0.1", "--port", "8000"]
