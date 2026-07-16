@@ -226,7 +226,7 @@ def _normalize_stream(stream: str) -> str:
 
 
 def _contains_only_stream_characters(value: str) -> bool:
-    return all(character.isalnum() or character in {"@", "_", "."} for character in value)
+    return all(character.isalnum() or character in {"@", "_", ".", "!"} for character in value)
 
 
 def _reject_forbidden(value: str) -> None:

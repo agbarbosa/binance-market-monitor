@@ -17,5 +17,8 @@ uv run ruff check .
 uv run mypy src
 uv run binance-market-monitor schema --output schemas
 uv run binance-market-monitor replay fixtures/events.jsonl
+uv run binance-market-monitor monitor --config configs/config.example.yaml --bounded --broad-messages 5 --deep-messages 1 --no-futures
 uv run uvicorn binance_market_monitor.app:app --host 127.0.0.1 --port 8000
 ```
+
+See `docs/runbook-live-runtime.md` for live smoke checks, bounded runtime, and Futures degradation notes.

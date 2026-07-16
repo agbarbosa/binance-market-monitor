@@ -41,6 +41,9 @@ dist/
 .idea/
 .DS_Store
 
+# Agent-local planning artifacts
+.hermes/
+
 # Temporary files
 .tmp/
 /tmp/

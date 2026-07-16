@@ -17,6 +17,8 @@ class ApiState:
     candidates: list[dict[str, Any]] = field(default_factory=list)
     alerts: list[dict[str, Any]] = field(default_factory=list)
     webhook_url: str | None = None
+    health: dict[str, Any] = field(default_factory=lambda: {"status": "initialized"})
+    metrics: dict[str, Any] = field(default_factory=dict)
 
 
 def create_app(state: ApiState | None = None) -> FastAPI:
@@ -37,10 +39,12 @@ def create_app(state: ApiState | None = None) -> FastAPI:
 
     @app.get("/health/binance")
     def binance_health() -> dict[str, object]:
-        return {"status": "unavailable", "live_connectivity": "disabled_by_default"}
+        return app_state.health
 
     @app.get("/metrics/summary")
     def metrics_summary() -> dict[str, object]:
+        if app_state.metrics:
+            return app_state.metrics
         return {
             "books": len(app_state.books),
             "candidates": len(app_state.candidates),

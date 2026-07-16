@@ -75,6 +75,19 @@ class LoggingConfig(StrictBaseModel):
     level: str = "INFO"
 
 
+class RuntimeConfig(StrictBaseModel):
+    rest_timeout_seconds: float = Field(default=5.0, gt=0)
+    ws_timeout_seconds: float = Field(default=10.0, gt=0)
+    queue_maxsize: int = Field(default=2_000, gt=0)
+    stage1_history_points: int = Field(default=60, ge=3)
+    broad_stream_message_limit: int | None = Field(default=None, ge=0)
+    deep_stream_message_limit: int | None = Field(default=None, ge=0)
+    futures_enabled: bool = False
+    warmup_min_trades: int = Field(default=3, ge=0)
+    snapshot_limit: int = Field(default=100, gt=0)
+    max_universe_symbols: int = Field(default=200, gt=0)
+
+
 class ApiConfig(StrictBaseModel):
     bind_host: str = "127.0.0.1"
     bind_port: int = Field(default=8000, ge=1, le=65_535)
@@ -103,6 +116,7 @@ class AppConfig(StrictBaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     webhook: WebhookConfig = Field(default_factory=WebhookConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
 
     @classmethod
