@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,10 @@ import pytest
 
 from binance_market_monitor.api.server import ApiState
 from binance_market_monitor.config import AppConfig
+from binance_market_monitor.connectors.binance import BinanceConnectorError
+from binance_market_monitor.runtime import engine as engine_module
 from binance_market_monitor.runtime.engine import LiveMonitorEngine, LiveRuntimeConfig
+from binance_market_monitor.scanner.stage2 import TradePrint
 
 
 class FakeRestTransport:
@@ -238,21 +242,23 @@ async def _wait_for_candidate(api_state: ApiState, *, timeout_seconds: float = 2
 
 
 async def _feed_stage1_messages(stream: InteractiveStreamTransport) -> None:
-    for message in _messages_for_url("!miniticker@arr"):
-        await stream.push("!miniticker@arr", message)
+    for message in _messages_for_url("!ticker_1h@arr"):
+        await stream.push("!ticker_1h@arr", message)
     for message in _messages_for_url("!bookticker"):
         await stream.push("!bookticker", message)
 
 
 def _messages_for_url(url: str) -> list[dict[str, Any]]:
-    if "!miniticker@arr" in url:
+    if "!ticker_1h@arr" in url:
         return [
-            {"data": [{"s": "BTCUSDT", "c": "100", "q": "1000", "n": 10}]},
-            {"data": [{"s": "BTCUSDT", "c": "101", "q": "1100", "n": 11}]},
-            {"data": [{"s": "BTCUSDT", "c": "101", "q": "1200", "n": 12}]},
-            {"data": [{"s": "FOOUSDT", "c": "10", "q": "100", "n": 10}]},
-            {"data": [{"s": "FOOUSDT", "c": "12", "q": "300", "n": 30}]},
-            {"data": [{"s": "FOOUSDT", "c": "15", "q": "900", "n": 90}]},
+            {"data": [{"s": "BTCUSDT", "E": 1_784_159_100_000, "c": "99", "q": "800", "n": 8}]},
+            {"data": [{"s": "BTCUSDT", "E": 1_784_159_400_000, "c": "100", "q": "1000", "n": 10}]},
+            {"data": [{"s": "BTCUSDT", "E": 1_784_159_700_000, "c": "101", "q": "1100", "n": 11}]},
+            {"data": [{"s": "BTCUSDT", "E": 1_784_160_000_000, "c": "101", "q": "1200", "n": 12}]},
+            {"data": [{"s": "FOOUSDT", "E": 1_784_159_100_000, "c": "9", "q": "50", "n": 5}]},
+            {"data": [{"s": "FOOUSDT", "E": 1_784_159_400_000, "c": "10", "q": "100", "n": 10}]},
+            {"data": [{"s": "FOOUSDT", "E": 1_784_159_700_000, "c": "12", "q": "300", "n": 30}]},
+            {"data": [{"s": "FOOUSDT", "E": 1_784_160_000_000, "c": "15", "q": "900", "n": 90}]},
         ]
     if "!bookticker" in url:
         return [
@@ -322,6 +328,7 @@ async def test_live_engine_runs_bounded_offline_cycle_and_updates_api_state(tmp_
     assert api_state.books[("spot", "FOOUSDT")].is_valid
     assert api_state.books[("usd_m_futures", "FOOUSDT")].is_valid
     assert api_state.health["status"] == "running"
+    assert api_state.health["universe_symbol_names"] == ["BTCUSDT", "ETHUSDT", "FOOUSDT"]
     assert api_state.metrics["processed_messages"] >= 10
     assert result.storage_rows_written > 0
     assert (tmp_path / "stage1_candidates").exists()
@@ -364,7 +371,7 @@ async def test_run_forever_consumes_broad_streams_concurrently_and_evaluates_sta
     task = asyncio.create_task(engine.run_forever(stop_event=stop_event))
 
     try:
-        await stream.wait_for_url("!miniticker@arr")
+        await stream.wait_for_url("!ticker_1h@arr")
         await stream.wait_for_url("!bookticker")
         await _feed_stage1_messages(stream)
         await _wait_for_candidate(api_state)
@@ -397,7 +404,7 @@ async def test_run_forever_bootstraps_once_across_evaluation_cycles(tmp_path: Pa
     task = asyncio.create_task(engine.run_forever(stop_event=stop_event))
 
     try:
-        await stream.wait_for_url("!miniticker@arr")
+        await stream.wait_for_url("!ticker_1h@arr")
         await stream.wait_for_url("!bookticker")
         await _feed_stage1_messages(stream)
         await _wait_for_candidate(engine.api_state)
@@ -412,6 +419,131 @@ async def test_run_forever_bootstraps_once_across_evaluation_cycles(tmp_path: Pa
             await asyncio.gather(task, return_exceptions=True)
 
     assert rest.exchange_info_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_filters_and_ranks_eligible_usdt_symbols_before_cap(tmp_path: Path) -> None:
+    class OrderingRestTransport(FakeRestTransport):
+        async def get_json(self, url: str, timeout_seconds: float) -> dict[str, Any]:
+            if "exchangeInfo" in url:
+                return {
+                    "symbols": [
+                        {
+                            "symbol": "ETHBTC",
+                            "baseAsset": "ETH",
+                            "quoteAsset": "BTC",
+                            "status": "TRADING",
+                        },
+                        {
+                            "symbol": "LTCBTC",
+                            "baseAsset": "LTC",
+                            "quoteAsset": "BTC",
+                            "status": "TRADING",
+                        },
+                        {
+                            "symbol": "AAABTC",
+                            "baseAsset": "AAA",
+                            "quoteAsset": "BTC",
+                            "status": "TRADING",
+                        },
+                        {
+                            "symbol": "BBBUSDT",
+                            "baseAsset": "BBB",
+                            "quoteAsset": "USDT",
+                            "status": "TRADING",
+                        },
+                        {
+                            "symbol": "AAAUSDT",
+                            "baseAsset": "AAA",
+                            "quoteAsset": "USDT",
+                            "status": "TRADING",
+                        },
+                        {
+                            "symbol": "CCCUSDT",
+                            "baseAsset": "CCC",
+                            "quoteAsset": "USDT",
+                            "status": "TRADING",
+                        },
+                    ]
+                }
+            if "ticker/24hr" in url:
+                return {
+                    "items": [
+                        {"symbol": "AAAUSDT", "quoteVolume": "1000"},
+                        {"symbol": "BBBUSDT", "quoteVolume": "3000"},
+                        {"symbol": "CCCUSDT", "quoteVolume": "2000"},
+                    ]
+                }
+            return await super().get_json(url, timeout_seconds)
+
+    engine = LiveMonitorEngine(
+        app_config=AppConfig.model_validate(
+            {
+                "universe": {
+                    "min_quote_volume_usdt": "100",
+                    "min_history_minutes": 0,
+                    "min_listing_age_days": 0,
+                },
+                "storage": {"base_path": str(tmp_path)},
+            }
+        ),
+        runtime_config=LiveRuntimeConfig(max_universe_symbols=2),
+        rest_transport=OrderingRestTransport(),
+        spot_stream_transport=FakeStreamTransport(),
+    )
+
+    await engine.bootstrap()
+
+    assert engine.universe == ["BBBUSDT", "CCCUSDT"]
+    assert engine.api_state.health["universe_symbols"] == 2
+    assert engine.api_state.health["universe_symbol_names"] == ["BBBUSDT", "CCCUSDT"]
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_fails_closed_when_all_market_volume_snapshot_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    class EmptyVolumeTransport(FakeRestTransport):
+        async def get_json(self, url: str, timeout_seconds: float) -> dict[str, Any]:
+            if "ticker/24hr" in url:
+                return {"items": []}
+            return await super().get_json(url, timeout_seconds)
+
+    engine = LiveMonitorEngine(
+        app_config=_test_config(tmp_path),
+        rest_transport=EmptyVolumeTransport(),
+        spot_stream_transport=FakeStreamTransport(),
+    )
+
+    with pytest.raises(BinanceConnectorError, match="all-market 24h ticker"):
+        await engine.bootstrap()
+
+
+def test_rolling_ticker_uses_real_trade_count_and_rejects_missing_count(tmp_path: Path) -> None:
+    engine = LiveMonitorEngine(
+        app_config=_test_config(tmp_path),
+        rest_transport=FakeRestTransport(),
+        spot_stream_transport=FakeStreamTransport(),
+    )
+    engine.universe = ["FOOUSDT"]
+
+    engine._handle_spot_rolling_ticker(  # noqa: SLF001 - verifies public-feed normalization.
+        {"data": [{"s": "FOOUSDT", "E": 1_784_160_000_000, "c": "15", "q": "900", "n": 90}]}
+    )
+    engine._handle_spot_rolling_ticker(  # noqa: SLF001 - malformed events must be ignored.
+        {"data": [{"s": "FOOUSDT", "E": 1_784_160_001_000, "c": "16", "q": "950"}]}
+    )
+
+    assert len(engine.histories["FOOUSDT"]) == 1
+    assert engine.histories["FOOUSDT"][0].trade_count == 90
+
+
+def test_fresh_trades_excludes_stale_cvd_inputs() -> None:
+    now = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+    stale = TradePrint(now - timedelta(seconds=11), Decimal("10"), Decimal("2"), False, "spot")
+    fresh = TradePrint(now - timedelta(seconds=5), Decimal("11"), Decimal("3"), False, "spot")
+
+    assert engine_module._fresh_trades([stale, fresh], now=now, max_age_ms=10_000) == [fresh]
 
 
 @pytest.mark.asyncio

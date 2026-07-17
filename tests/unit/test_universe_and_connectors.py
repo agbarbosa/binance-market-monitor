@@ -20,6 +20,7 @@ from binance_market_monitor.universe import (
     SpotSymbolMetadata,
     UniverseFilterConfig,
     filter_spot_universe,
+    select_spot_universe,
 )
 
 
@@ -215,6 +216,9 @@ def test_filter_spot_universe_excludes_ineligible_markets_deterministically() ->
         SpotSymbolMetadata("BTCUSDT", "BTC", "USDT", "TRADING", old_listing, 240),
         SpotSymbolMetadata("ETHUSDC", "ETH", "USDC", "TRADING", old_listing, 240),
         SpotSymbolMetadata("USDCUSDT", "USDC", "USDT", "TRADING", old_listing, 240),
+        SpotSymbolMetadata("USD1USDT", "USD1", "USDT", "TRADING", old_listing, 240),
+        SpotSymbolMetadata("RLUSDUSDT", "RLUSD", "USDT", "TRADING", old_listing, 240),
+        SpotSymbolMetadata("EURUSDT", "EUR", "USDT", "TRADING", old_listing, 240),
         SpotSymbolMetadata("BTCUPUSDT", "BTCUP", "USDT", "TRADING", old_listing, 240),
         SpotSymbolMetadata("HALTEDUSDT", "HALTED", "USDT", "BREAK", old_listing, 240),
         SpotSymbolMetadata("LOWVOLUSDT", "LOWVOL", "USDT", "TRADING", old_listing, 240),
@@ -241,12 +245,45 @@ def test_filter_spot_universe_excludes_ineligible_markets_deterministically() ->
     assert result.exclusion_reasons == {
         "ETHUSDC": "quote_asset_not_allowed",
         "USDCUSDT": "stablecoin_pair",
+        "USD1USDT": "stablecoin_pair",
+        "RLUSDUSDT": "stablecoin_pair",
+        "EURUSDT": "stablecoin_pair",
         "BTCUPUSDT": "leveraged_token_suffix",
         "HALTEDUSDT": "status_not_trading",
         "LOWVOLUSDT": "quote_volume_below_minimum",
         "NEWHISTUSDT": "insufficient_history",
         "NEWLISTUSDT": "recent_listing",
         "DENIEDUSDT": "denylist",
+    }
+
+
+def test_select_spot_universe_filters_then_ranks_and_caps_deterministically() -> None:
+    symbols = [
+        SpotSymbolMetadata("ETHBTC", "ETH", "BTC", "TRADING", None, 120),
+        SpotSymbolMetadata("AAAUSDT", "AAA", "USDT", "TRADING", None, 120),
+        SpotSymbolMetadata("CCCUSDT", "CCC", "USDT", "TRADING", None, 120),
+        SpotSymbolMetadata("BBBUSDT", "BBB", "USDT", "TRADING", None, 120),
+    ]
+
+    result = select_spot_universe(
+        symbols,
+        quote_volumes={
+            "AAAUSDT": Decimal("1000"),
+            "BBBUSDT": Decimal("3000"),
+            "CCCUSDT": Decimal("3000"),
+        },
+        config=UniverseFilterConfig(
+            min_quote_volume=Decimal("100"),
+            min_history_minutes=0,
+            min_listing_age=timedelta(0),
+        ),
+        max_symbols=2,
+    )
+
+    assert [symbol.symbol for symbol in result.included] == ["BBBUSDT", "CCCUSDT"]
+    assert result.exclusion_reasons == {
+        "AAAUSDT": "universe_cardinality_cap",
+        "ETHBTC": "quote_asset_not_allowed",
     }
 
 

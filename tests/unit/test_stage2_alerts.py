@@ -29,8 +29,12 @@ def _candidate(symbol: str = "SOLUSDT") -> Stage1CandidateRecord:
         score=Decimal("80"),
         score_version="stage1-v1",
         executable_liquidity_score=Decimal("100000"),
-        features={"return_5m": Decimal("0.08"), "relative_volume": Decimal("3")},
-        thresholds={},
+        features={
+            "return_5m": Decimal("0.08"),
+            "relative_volume": Decimal("3"),
+            "spread_bps": Decimal("2"),
+        },
+        thresholds={"max_spread_bps": Decimal("5")},
         reason_codes=["momentum", "relative_volume", "trade_acceleration"],
         input_freshness_ms={"ticker": 100, "book": 100},
     )
@@ -69,13 +73,31 @@ def test_futures_context_has_basis_funding_liquidations_and_never_open_interest(
     assert "open_interest" not in context.features
 
 
-def test_stage2_requires_multi_evidence_and_degrades_missing_futures_context() -> None:
-    single = make_stage2_decision(
+def test_stage2_requires_multi_evidence_and_allows_confirmed_spot_only_context() -> None:
+    spot_only = make_stage2_decision(
         Stage2Input(candidate=_candidate(), spot_cvd=Decimal("1000"), futures_context=None, now=NOW)
     )
-    assert single.decision == "degraded"
-    assert "futures_context_missing" in single.reason_codes
-    assert single.open_interest_available is False
+    assert spot_only.decision == "watch"
+    assert spot_only.evidence_confidence == "medium"
+    assert {"stage1_market_anomaly", "spot_flow"}.issubset(spot_only.evidence_groups)
+    assert "futures_context_missing" in spot_only.reason_codes
+    assert spot_only.open_interest_available is False
+
+    unconfirmed = make_stage2_decision(
+        Stage2Input(candidate=_candidate(), spot_cvd=Decimal("0"), futures_context=None, now=NOW)
+    )
+    assert unconfirmed.decision == "degraded"
+    assert set(unconfirmed.evidence_groups) == {"stage1_market_anomaly", "liquidity"}
+
+    flat_candidate = _candidate()
+    flat_candidate.features["return_5m"] = Decimal("0")
+    flat = make_stage2_decision(
+        Stage2Input(
+            candidate=flat_candidate, spot_cvd=Decimal("1000"), futures_context=None, now=NOW
+        )
+    )
+    assert flat.decision == "degraded"
+    assert "spot_flow" not in flat.evidence_groups
 
     context = FuturesContext.from_public_data(
         spot_price=Decimal("100"),
@@ -92,7 +114,13 @@ def test_stage2_requires_multi_evidence_and_degrades_missing_futures_context() -
     )
 
     assert decision.decision == "watch"
-    assert set(decision.evidence_groups) >= {"spot_flow", "futures_basis", "liquidations"}
+    assert set(decision.evidence_groups) >= {
+        "stage1_market_anomaly",
+        "spot_flow",
+        "futures_basis",
+        "liquidations",
+    }
+    assert "funding_context" not in decision.evidence_groups
     assert "multi_evidence_watch" in decision.reason_codes
 
 

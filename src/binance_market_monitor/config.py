@@ -28,7 +28,12 @@ class UniverseConfig(StrictBaseModel):
 
 class Stage1Config(StrictBaseModel):
     min_quote_volume_usdt: str = "10000000"
+    min_history_span_minutes: int = Field(default=15, ge=15)
+    window_sample_tolerance_seconds: int = Field(default=90, gt=0)
     min_relative_volume_5m: float = Field(default=2.0, ge=0)
+    min_trade_acceleration_5m: float = Field(default=2.0, ge=0)
+    min_price_move_5m: float = Field(default=0.03, ge=0)
+    range_proximity_bps: float = Field(default=50.0, ge=0)
     max_spread_bps: float = Field(default=5.0, gt=0)
 
 
@@ -79,7 +84,7 @@ class RuntimeConfig(StrictBaseModel):
     rest_timeout_seconds: float = Field(default=5.0, gt=0)
     ws_timeout_seconds: float = Field(default=10.0, gt=0)
     queue_maxsize: int = Field(default=2_000, gt=0)
-    stage1_history_points: int = Field(default=60, ge=3)
+    stage1_history_points: int = Field(default=1_200, ge=3)
     broad_stream_message_limit: int | None = Field(default=None, ge=0)
     deep_stream_message_limit: int | None = Field(default=None, ge=0)
     futures_enabled: bool = False

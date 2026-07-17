@@ -8,7 +8,12 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol, cast
 
-from binance_market_monitor.alerts.engine import AlertEngine, AlertPayloadRecord, AlertSuppression
+from binance_market_monitor.alerts.engine import (
+    AlertEngine,
+    AlertEngineConfig,
+    AlertPayloadRecord,
+    AlertSuppression,
+)
 from binance_market_monitor.alerts.webhook import AsyncWebhookDispatcher, WebhookConfig
 from binance_market_monitor.api.server import ApiState
 from binance_market_monitor.config import AppConfig
@@ -42,7 +47,7 @@ from binance_market_monitor.storage.parquet import ParquetEventStore
 from binance_market_monitor.universe import (
     SpotSymbolMetadata,
     UniverseFilterConfig,
-    filter_spot_universe,
+    select_spot_universe,
 )
 
 
@@ -73,7 +78,7 @@ class LiveRuntimeConfig:
     rest_timeout_seconds: float = 5.0
     ws_timeout_seconds: float = 10.0
     queue_maxsize: int = 2_000
-    stage1_history_points: int = 60
+    stage1_history_points: int = 1_200
     broad_stream_message_limit: int | None = None
     deep_stream_message_limit: int | None = None
     futures_enabled: bool = False
@@ -100,6 +105,7 @@ class _BookTicker:
     bid_qty: Decimal
     ask: Decimal
     ask_qty: Decimal
+    updated_at: datetime
 
 
 @dataclass(slots=True)
@@ -151,7 +157,9 @@ class LiveMonitorEngine:
             else None
         )
         self.storage = ParquetEventStore(self.app_config.storage.base_path)
-        self.alert_engine = AlertEngine()
+        self.alert_engine = AlertEngine(
+            AlertEngineConfig(cooldown_seconds=self.app_config.alerts.cooldown_seconds)
+        )
         webhook_url = (
             self.app_config.webhook.url.get_secret_value()
             if self.app_config.webhook.url is not None
@@ -243,12 +251,9 @@ class LiveMonitorEngine:
     async def bootstrap(self) -> None:
         exchange_info = await self.spot_rest.exchange_info()
         symbols = _parse_exchange_symbols(exchange_info)
-        limited_symbols = symbols[: self.runtime_config.max_universe_symbols]
-        quote_volumes = await self._load_quote_volumes(
-            [symbol.symbol for symbol in limited_symbols]
-        )
-        filter_result = filter_spot_universe(
-            limited_symbols,
+        quote_volumes = await self._load_quote_volumes()
+        filter_result = select_spot_universe(
+            symbols,
             quote_volumes=quote_volumes,
             config=UniverseFilterConfig(
                 allowed_quote_assets=self.app_config.universe.eligible_quote_assets,
@@ -258,19 +263,26 @@ class LiveMonitorEngine:
                 denied_symbols=self.app_config.universe.denied_symbols,
                 now=self._now(),
             ),
+            max_symbols=self.runtime_config.max_universe_symbols,
         )
         self.universe = [symbol.symbol for symbol in filter_result.included]
-        self.api_state.health["universe_symbols"] = len(self.universe)
+        self.api_state.health.update(
+            {
+                "universe_symbols": len(self.universe),
+                "universe_symbol_names": list(self.universe),
+                "universe_exclusion_counts": _count_values(filter_result.exclusion_reasons),
+            }
+        )
         self._update_metrics()
 
     async def consume_broad_spot_streams(self) -> None:
         spot_urls = SpotWebSocketURLBuilder()
-        mini_url = spot_urls.raw_stream("!miniTicker@arr")
+        rolling_url = spot_urls.raw_stream("!ticker_1h@arr")
         book_url = spot_urls.raw_stream("!bookTicker")
         await asyncio.gather(
             self._consume_stream(
-                mini_url,
-                self._handle_spot_mini_ticker,
+                rolling_url,
+                self._handle_spot_rolling_ticker,
                 self.spot_stream_transport,
                 max_messages=self.runtime_config.broad_stream_message_limit,
             ),
@@ -285,10 +297,10 @@ class LiveMonitorEngine:
     def _start_broad_spot_tasks(self) -> None:
         spot_urls = SpotWebSocketURLBuilder()
         self._ensure_stream_task(
-            ("spot_broad", "mini_ticker"),
+            ("spot_broad", "rolling_ticker_1h"),
             self._consume_stream(
-                spot_urls.raw_stream("!miniTicker@arr"),
-                self._handle_spot_mini_ticker,
+                spot_urls.raw_stream("!ticker_1h@arr"),
+                self._handle_spot_rolling_ticker,
                 self.spot_stream_transport,
                 max_messages=None,
             ),
@@ -322,7 +334,16 @@ class LiveMonitorEngine:
                 ask_depth_notional=ticker.ask * ticker.ask_qty,
                 config=Stage1FeatureConfig(
                     min_history_points=3,
+                    min_history_span_minutes=self.app_config.stage1.min_history_span_minutes,
+                    window_sample_tolerance_seconds=(
+                        self.app_config.stage1.window_sample_tolerance_seconds
+                    ),
                     min_relative_volume=Decimal(str(self.app_config.stage1.min_relative_volume_5m)),
+                    min_trade_acceleration=Decimal(
+                        str(self.app_config.stage1.min_trade_acceleration_5m)
+                    ),
+                    min_price_move_5m=Decimal(str(self.app_config.stage1.min_price_move_5m)),
+                    range_proximity_bps=Decimal(str(self.app_config.stage1.range_proximity_bps)),
                     max_spread_bps=Decimal(str(self.app_config.stage1.max_spread_bps)),
                     min_liquidity_notional=Decimal(self.app_config.stage2.min_depth_notional_usdt),
                 ),
@@ -403,18 +424,47 @@ class LiveMonitorEngine:
         rows: list[dict[str, object]] = []
         alerts: list[dict[str, object]] = []
         for candidate in candidates:
-            spot_cvd = compute_cvd(self.trades.get(candidate.symbol, [])).value
+            now = self._now()
+            all_trades = self.trades.get(candidate.symbol, [])
+            trades = _fresh_trades(
+                all_trades,
+                now=now,
+                max_age_ms=self.app_config.stale_thresholds.aggregate_trade_ms,
+            )
+            self.trades[candidate.symbol] = trades
+            trade_data_stale = bool(all_trades) and not trades
+            spot_cvd = compute_cvd(trades).value
             decision = make_stage2_decision(
                 Stage2Input(
-                    candidate=cast(Any, candidate),
+                    candidate=candidate,
                     spot_cvd=spot_cvd,
                     futures_context=self._futures_context(candidate.symbol),
-                    now=self._now(),
+                    now=now,
+                    min_evidence_groups=self.app_config.stage2.min_evidence_groups,
+                    min_depth_notional=Decimal(self.app_config.stage2.min_depth_notional_usdt),
                 )
             )
             row = _stage2_to_dict(decision)
             rows.append(row)
-            maybe_alert = self.alert_engine.maybe_alert(decision, now=self._now())
+            book = self.spot_books.get(candidate.symbol)
+            book_ticker = self.book_tickers.get(candidate.symbol)
+            book_ticker_stale = book_ticker is None or (
+                _datetime_age_ms(book_ticker.updated_at, now)
+                > self.app_config.stale_thresholds.book_ticker_ms
+            )
+            maybe_alert = self.alert_engine.maybe_alert(
+                decision,
+                now=now,
+                stale=(
+                    candidate.input_freshness_ms.get("ticker", 0)
+                    > self.app_config.stale_thresholds.ticker_ms
+                    or trade_data_stale
+                    or book_ticker_stale
+                ),
+                invalid_book=book is None or not book.is_valid,
+                warmup=len(trades) < self.runtime_config.warmup_min_trades,
+                storage_available=True,
+            )
             if isinstance(maybe_alert, AlertPayloadRecord):
                 alert = maybe_alert.to_dict()
                 alerts.append(alert)
@@ -442,31 +492,18 @@ class LiveMonitorEngine:
             await self.futures_stream_transport.aclose()
         self._update_health("stopped")
 
-    async def _load_quote_volumes(self, symbols: list[str]) -> dict[str, Decimal]:
+    async def _load_quote_volumes(self) -> dict[str, Decimal]:
         url = SpotRestURLBuilder().api_path("ticker/24hr")
         try:
             raw = await _get_json_value(
                 self.rest_transport, url, self.runtime_config.rest_timeout_seconds
             )
-        except Exception:
-            raw = {"items": []}
+        except Exception as exc:
+            raise BinanceConnectorError("all-market 24h ticker request failed") from exc
         parsed = _parse_ticker_volumes(raw)
-        if parsed:
-            return parsed
-        volumes: dict[str, Decimal] = {}
-        builder = SpotRestURLBuilder()
-        for symbol in symbols[: self.runtime_config.max_universe_symbols]:
-            try:
-                item = await self.rest_transport.get_json(
-                    builder.api_path("ticker/24hr", {"symbol": symbol}),
-                    self.runtime_config.rest_timeout_seconds,
-                )
-            except Exception:
-                continue
-            volume = _decimal(item.get("quoteVolume"))
-            if volume is not None:
-                volumes[symbol] = volume
-        return volumes
+        if not parsed:
+            raise BinanceConnectorError("all-market 24h ticker returned no usable quote volumes")
+        return parsed
 
     async def _consume_stream(
         self,
@@ -484,10 +521,9 @@ class LiveMonitorEngine:
             handler(message)
             self._record_processed_message()
 
-    def _handle_spot_mini_ticker(self, message: dict[str, Any]) -> None:
+    def _handle_spot_rolling_ticker(self, message: dict[str, Any]) -> None:
         payload = message.get("data", message)
         items = payload if isinstance(payload, list) else [payload]
-        event_time = _event_time(message, self._now())
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -495,17 +531,17 @@ class LiveMonitorEngine:
             if symbol not in self.universe and symbol != "BTCUSDT":
                 continue
             price = _decimal(item.get("c"))
-            volume = _decimal(item.get("q") or item.get("v"))
-            if price is None or volume is None:
+            volume = _decimal(item.get("q"))
+            trade_count_value = _decimal(item.get("n"))
+            if price is None or volume is None or trade_count_value is None:
                 continue
-            trade_count = int(_decimal(item.get("n")) or volume)
             self.histories[symbol].append(
                 MarketSample(
-                    timestamp=event_time,
+                    timestamp=_event_time(item, self._now()),
                     symbol=symbol,
                     price=price,
                     volume=volume,
-                    trade_count=trade_count,
+                    trade_count=int(trade_count_value),
                 )
             )
 
@@ -520,7 +556,13 @@ class LiveMonitorEngine:
         ask_qty = _decimal(payload.get("A"))
         if not symbol or bid is None or bid_qty is None or ask is None or ask_qty is None:
             return
-        self.book_tickers[symbol] = _BookTicker(bid, bid_qty, ask, ask_qty)
+        self.book_tickers[symbol] = _BookTicker(
+            bid,
+            bid_qty,
+            ask,
+            ask_qty,
+            _event_time(payload, self._now()),
+        )
 
     def _handle_spot_closed_kline(self, message: dict[str, Any]) -> None:
         payload = message.get("data", message)
@@ -721,9 +763,7 @@ class LiveMonitorEngine:
             ask_depth_notional=ask_depth,
         )
 
-    def _ensure_stream_task(
-        self, key: tuple[str, str], coro: Coroutine[Any, Any, None]
-    ) -> None:
+    def _ensure_stream_task(self, key: tuple[str, str], coro: Coroutine[Any, Any, None]) -> None:
         existing = self._stream_tasks.get(key)
         if existing is not None and not existing.done():
             coro.close()
@@ -780,6 +820,7 @@ class LiveMonitorEngine:
                 "status": status,
                 "updated_at": self._now().isoformat(),
                 "futures_enabled": self.runtime_config.futures_enabled,
+                "deep_symbol_names": list(self.deep_symbols),
             }
         )
 
@@ -820,6 +861,13 @@ def _parse_exchange_symbols(payload: dict[str, Any]) -> list[SpotSymbolMetadata]
                 )
             )
     return symbols
+
+
+def _count_values(values: dict[str, str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values.values():
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 async def _get_json_value(transport: RestTransport, url: str, timeout_seconds: float) -> object:
@@ -937,6 +985,27 @@ def _age_ms(event_ms: object, now: datetime) -> int:
         return 0
     event_time = datetime.fromtimestamp(parsed / 1000, tz=UTC)
     return max(0, int((now.astimezone(UTC) - event_time).total_seconds() * 1000))
+
+
+def _datetime_age_ms(timestamp: datetime, now: datetime) -> int:
+    timestamp_utc = timestamp.astimezone(UTC) if timestamp.tzinfo else timestamp.replace(tzinfo=UTC)
+    now_utc = now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
+    return max(0, int((now_utc - timestamp_utc).total_seconds() * 1000))
+
+
+def _fresh_trades(trades: list[TradePrint], *, now: datetime, max_age_ms: int) -> list[TradePrint]:
+    now_utc = now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
+    fresh: list[TradePrint] = []
+    for trade in trades:
+        timestamp = (
+            trade.timestamp.astimezone(UTC)
+            if trade.timestamp.tzinfo
+            else trade.timestamp.replace(tzinfo=UTC)
+        )
+        age_ms = int((now_utc - timestamp).total_seconds() * 1000)
+        if 0 <= age_ms <= max_age_ms:
+            fresh.append(trade)
+    return fresh
 
 
 def _spread_bps(ticker: _BookTicker) -> Decimal:

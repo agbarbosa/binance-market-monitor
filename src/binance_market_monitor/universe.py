@@ -16,6 +16,21 @@ DEFAULT_STABLE_ASSETS = frozenset(
         "USDP",
         "USDD",
         "PYUSD",
+        "USD1",
+        "RLUSD",
+        "USDE",
+        "USDS",
+        "AEUR",
+        "EURI",
+        "EUR",
+        "TRY",
+        "BRL",
+        "GBP",
+        "AUD",
+        "PLN",
+        "RON",
+        "UAH",
+        "RUB",
     }
 )
 
@@ -109,6 +124,32 @@ def filter_spot_universe(
             exclusion_reasons[normalized_symbol] = reason
 
     return UniverseFilterResult(included=tuple(included), exclusion_reasons=exclusion_reasons)
+
+
+def select_spot_universe(
+    symbols: Sequence[SpotSymbolMetadata],
+    *,
+    quote_volumes: Mapping[str, Decimal],
+    config: UniverseFilterConfig,
+    max_symbols: int,
+) -> UniverseFilterResult:
+    """Filter first, rank eligible markets by liquidity, then apply the cardinality cap."""
+
+    if max_symbols < 1:
+        raise ValueError("max_symbols must be positive")
+    filtered = filter_spot_universe(symbols, quote_volumes=quote_volumes, config=config)
+    ranked = sorted(
+        filtered.included,
+        key=lambda item: (
+            -quote_volumes.get(_normalize_symbol(item.symbol), Decimal("0")),
+            item.symbol,
+        ),
+    )
+    selected = ranked[:max_symbols]
+    exclusion_reasons = dict(filtered.exclusion_reasons)
+    for symbol in ranked[max_symbols:]:
+        exclusion_reasons[_normalize_symbol(symbol.symbol)] = "universe_cardinality_cap"
+    return UniverseFilterResult(included=tuple(selected), exclusion_reasons=exclusion_reasons)
 
 
 def _first_exclusion_reason(

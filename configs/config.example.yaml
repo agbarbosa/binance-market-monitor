@@ -18,7 +18,12 @@ universe:
 
 stage1:
   min_quote_volume_usdt: "10000000"
+  min_history_span_minutes: 15
+  window_sample_tolerance_seconds: 90
   min_relative_volume_5m: 2.0
+  min_trade_acceleration_5m: 2.0
+  min_price_move_5m: 0.03
+  range_proximity_bps: 50.0
   max_spread_bps: 5.0
 
 stage2:
@@ -55,7 +60,7 @@ runtime:
   rest_timeout_seconds: 5.0
   ws_timeout_seconds: 10.0
   queue_maxsize: 2000
-  stage1_history_points: 60
+  stage1_history_points: 1200
   # Leave null for continuous runtime. Use small integers for bounded smoke runs.
   broad_stream_message_limit: null
   deep_stream_message_limit: null
