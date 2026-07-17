@@ -188,6 +188,7 @@ class LiveMonitorEngine:
         )
         self.book_tickers: dict[str, _BookTicker] = {}
         self.spot_books: dict[str, LocalOrderBook] = {}
+        self.spot_book_updated_at: dict[str, datetime] = {}
         self.trades: dict[str, list[TradePrint]] = defaultdict(list)
         self.futures_trades: dict[str, list[TradePrint]] = defaultdict(list)
         self.futures: dict[str, _FuturesSymbolState] = defaultdict(_FuturesSymbolState)
@@ -452,6 +453,11 @@ class LiveMonitorEngine:
                 _datetime_age_ms(book_ticker.updated_at, now)
                 > self.app_config.stale_thresholds.book_ticker_ms
             )
+            depth_book_updated_at = self.spot_book_updated_at.get(candidate.symbol)
+            depth_book_stale = depth_book_updated_at is None or (
+                _datetime_age_ms(depth_book_updated_at, now)
+                > self.app_config.stale_thresholds.depth_book_ms
+            )
             maybe_alert = self.alert_engine.maybe_alert(
                 decision,
                 now=now,
@@ -460,6 +466,7 @@ class LiveMonitorEngine:
                     > self.app_config.stale_thresholds.ticker_ms
                     or trade_data_stale
                     or book_ticker_stale
+                    or depth_book_stale
                 ),
                 invalid_book=book is None or not book.is_valid,
                 warmup=len(trades) < self.runtime_config.warmup_min_trades,
@@ -599,6 +606,7 @@ class LiveMonitorEngine:
         if book is None or book.state != "warming" and not book.is_valid:
             book = LocalOrderBook(market="spot", symbol=symbol)
             self.spot_books[symbol] = book
+            self.spot_book_updated_at.pop(symbol, None)
         self.api_state.books[("spot", symbol)] = book
         urls = SpotWebSocketURLBuilder()
         stream_url = urls.single_stream(symbol, "depth@100ms")
@@ -607,7 +615,8 @@ class LiveMonitorEngine:
             self.runtime_config.ws_timeout_seconds,
             max_messages=self.runtime_config.deep_stream_message_limit,
         ):
-            diff = _spot_depth_diff(message, now=self._now())
+            received_at = self._now()
+            diff = _spot_depth_diff(message, now=received_at)
             if diff is None:
                 continue
             if book.state == "warming":
@@ -616,7 +625,7 @@ class LiveMonitorEngine:
                 self._record_processed_message()
                 await self._apply_spot_snapshot(symbol, book)
                 continue
-            book.apply_diff(diff)
+            self._apply_spot_book_diff(symbol, book, diff, received_at=received_at)
             await self._record_depth_queue_item("spot", symbol, message)
             self._record_processed_message()
             if not book.is_valid:
@@ -625,11 +634,30 @@ class LiveMonitorEngine:
                 self.api_state.books[("spot", symbol)] = book
                 continue
 
+    def _apply_spot_book_diff(
+        self,
+        symbol: str,
+        book: LocalOrderBook,
+        diff: DepthDiff,
+        *,
+        received_at: datetime,
+    ) -> None:
+        previous_update_id = book.last_update_id
+        book.apply_diff(diff)
+        if not book.is_valid:
+            self.spot_book_updated_at.pop(symbol, None)
+        elif book.last_update_id != previous_update_id:
+            self.spot_book_updated_at[symbol] = received_at
+
     async def _apply_spot_snapshot(self, symbol: str, book: LocalOrderBook) -> None:
         snapshot_payload = await self.spot_rest.depth_snapshot(
             symbol, self.runtime_config.snapshot_limit
         )
         book.apply_snapshot(_depth_snapshot_from_payload(snapshot_payload))
+        if book.is_valid:
+            self.spot_book_updated_at[symbol] = self._now()
+        else:
+            self.spot_book_updated_at.pop(symbol, None)
         self.api_state.books[("spot", symbol)] = book
 
     async def _consume_symbol_trades(self, symbol: str) -> None:
@@ -813,6 +841,8 @@ class LiveMonitorEngine:
         book = self.api_state.books.get((market, symbol))
         if book is not None:
             book.invalidate(reason)
+        if market == "spot":
+            self.spot_book_updated_at.pop(symbol, None)
 
     def _update_health(self, status: str) -> None:
         self.api_state.health.update(

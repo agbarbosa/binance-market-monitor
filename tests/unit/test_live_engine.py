@@ -12,8 +12,10 @@ import pytest
 from binance_market_monitor.api.server import ApiState
 from binance_market_monitor.config import AppConfig
 from binance_market_monitor.connectors.binance import BinanceConnectorError
+from binance_market_monitor.orderbook.book import DepthDiff, DepthSnapshot, LocalOrderBook
 from binance_market_monitor.runtime import engine as engine_module
 from binance_market_monitor.runtime.engine import LiveMonitorEngine, LiveRuntimeConfig
+from binance_market_monitor.scanner.stage1 import Stage1CandidateRecord
 from binance_market_monitor.scanner.stage2 import TradePrint
 
 
@@ -544,6 +546,113 @@ def test_fresh_trades_excludes_stale_cvd_inputs() -> None:
     fresh = TradePrint(now - timedelta(seconds=5), Decimal("11"), Decimal("3"), False, "spot")
 
     assert engine_module._fresh_trades([stale, fresh], now=now, max_age_ms=10_000) == [fresh]
+
+
+@pytest.mark.asyncio
+async def test_stage2_suppresses_valid_but_stale_local_depth_book(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+    engine = LiveMonitorEngine(
+        app_config=_test_config(tmp_path),
+        runtime_config=LiveRuntimeConfig(warmup_min_trades=1),
+        api_state=ApiState(storage_path=tmp_path),
+        rest_transport=FakeRestTransport(),
+        spot_stream_transport=FakeStreamTransport(),
+        now=lambda: now,
+    )
+    engine._handle_spot_book_ticker(  # noqa: SLF001 - deterministic runtime regression.
+        {"data": {"s": "FOOUSDT", "b": "10.00", "B": "10000", "a": "10.01", "A": "10000"}}
+    )
+    book = LocalOrderBook(market="spot", symbol="FOOUSDT")
+    book.apply_snapshot(
+        DepthSnapshot(
+            last_update_id=100,
+            bids=[("10.00", "10000")],
+            asks=[("10.01", "10000")],
+        )
+    )
+    engine.spot_books["FOOUSDT"] = book
+    engine.spot_book_updated_at["FOOUSDT"] = now - timedelta(seconds=4)
+    engine.trades["FOOUSDT"] = [
+        TradePrint(now - timedelta(seconds=1), Decimal("10"), Decimal("10"), False, "spot")
+    ]
+    candidate = Stage1CandidateRecord(
+        candidate_id="stage1:FOOUSDT:1",
+        detected_at=now,
+        symbol="FOOUSDT",
+        score=Decimal("80"),
+        score_version="stage1-hot-v2",
+        executable_liquidity_score=Decimal("100000"),
+        features={
+            "return_5m": Decimal("0.08"),
+            "relative_volume": Decimal("3"),
+            "spread_bps": Decimal("2"),
+        },
+        thresholds={"max_spread_bps": Decimal("5")},
+        reason_codes=["momentum", "relative_volume", "trade_acceleration"],
+        input_freshness_ms={"ticker": 0, "book": 0},
+    )
+
+    await engine.evaluate_stage2([candidate])
+
+    assert engine.api_state.alerts == []
+    assert engine.api_state.health["last_alert_suppression"] == ["suppressed_stale_data"]
+
+
+def test_obsolete_depth_diff_does_not_refresh_local_book_timestamp(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+    engine = LiveMonitorEngine(
+        app_config=_test_config(tmp_path),
+        runtime_config=LiveRuntimeConfig(),
+        api_state=ApiState(storage_path=tmp_path),
+        rest_transport=FakeRestTransport(),
+        spot_stream_transport=FakeStreamTransport(),
+        now=lambda: now,
+    )
+    book = LocalOrderBook(market="spot", symbol="FOOUSDT")
+    book.apply_snapshot(
+        DepthSnapshot(
+            last_update_id=100,
+            bids=[("10.00", "10000")],
+            asks=[("10.01", "10000")],
+        )
+    )
+    previous_update = now - timedelta(seconds=2)
+    engine.spot_book_updated_at["FOOUSDT"] = previous_update
+
+    engine._apply_spot_book_diff(  # noqa: SLF001 - deterministic runtime regression.
+        "FOOUSDT",
+        book,
+        DepthDiff(
+            first_update_id=90,
+            final_update_id=100,
+            bids=[("10.00", "9999")],
+            asks=[],
+        ),
+        received_at=now,
+    )
+
+    assert engine.spot_book_updated_at["FOOUSDT"] == previous_update
+
+
+def test_depth_queue_overflow_clears_local_book_timestamp(tmp_path: Path) -> None:
+    engine = LiveMonitorEngine(
+        app_config=_test_config(tmp_path),
+        runtime_config=LiveRuntimeConfig(),
+        api_state=ApiState(storage_path=tmp_path),
+        rest_transport=FakeRestTransport(),
+        spot_stream_transport=FakeStreamTransport(),
+        now=lambda: datetime(2026, 7, 16, 12, 0, tzinfo=UTC),
+    )
+    book = LocalOrderBook(market="spot", symbol="FOOUSDT")
+    engine.api_state.books[("spot", "FOOUSDT")] = book
+    engine.spot_book_updated_at["FOOUSDT"] = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+
+    engine._mark_book_overflow(  # noqa: SLF001 - deterministic runtime regression.
+        "spot", "FOOUSDT", "depth_queue_overflow"
+    )
+
+    assert not book.is_valid
+    assert "FOOUSDT" not in engine.spot_book_updated_at
 
 
 @pytest.mark.asyncio

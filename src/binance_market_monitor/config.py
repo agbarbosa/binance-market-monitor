@@ -54,6 +54,7 @@ class AlertsConfig(StrictBaseModel):
 class StaleThresholdsConfig(StrictBaseModel):
     ticker_ms: int = Field(default=5_000, gt=0)
     book_ticker_ms: int = Field(default=3_000, gt=0)
+    depth_book_ms: int = Field(default=3_000, gt=0)
     aggregate_trade_ms: int = Field(default=10_000, gt=0)
     futures_mark_price_ms: int = Field(default=5_000, gt=0)
 

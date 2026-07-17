@@ -40,6 +40,7 @@ alerts:
 stale_thresholds:
   ticker_ms: 5000
   book_ticker_ms: 3000
+  depth_book_ms: 3000
   aggregate_trade_ms: 10000
   futures_mark_price_ms: 5000
 
