@@ -1,0 +1,77 @@
+# Example configuration for Binance Market Monitor.
+# Copy this file to a local, ignored config file and provide sensitive values
+# through environment variables only.
+
+universe:
+  eligible_quote_assets: ["USDT"]
+  exclusion_patterns:
+    - ".*(UP|DOWN|BULL|BEAR)USDT$"
+  denied_symbols:
+    - "BUSDUSDT"
+  permanent_deep_symbols:
+    - "BTCUSDT"
+    - "ETHUSDT"
+  max_dynamic_candidates: 20
+  min_quote_volume_usdt: "10000000"
+  min_history_minutes: 60
+  min_listing_age_days: 7
+
+stage1:
+  min_quote_volume_usdt: "10000000"
+  min_history_span_minutes: 15
+  window_sample_tolerance_seconds: 90
+  min_relative_volume_5m: 2.0
+  min_trade_acceleration_5m: 2.0
+  min_price_move_5m: 0.03
+  range_proximity_bps: 50.0
+  max_spread_bps: 5.0
+
+stage2:
+  min_evidence_groups: 2
+  min_depth_notional_usdt: "50000"
+
+features:
+  windows: ["1m", "5m", "15m", "1h"]
+
+alerts:
+  cooldown_seconds: 900
+  repeated_symbol_window_seconds: 21600
+
+stale_thresholds:
+  ticker_ms: 5000
+  book_ticker_ms: 3000
+  depth_book_ms: 3000
+  aggregate_trade_ms: 10000
+  futures_mark_price_ms: 5000
+
+storage:
+  base_path: "data"
+  retention_days: 14
+
+webhook:
+  enabled: false
+  # Set BMM_WEBHOOK_URL at runtime. Do not commit webhook URLs.
+  timeout_seconds: 5.0
+  max_retries: 3
+
+logging:
+  level: "INFO"
+
+runtime:
+  rest_timeout_seconds: 5.0
+  ws_timeout_seconds: 10.0
+  queue_maxsize: 2000
+  stage1_history_points: 1200
+  # Leave null for continuous runtime. Use small integers for bounded smoke runs.
+  broad_stream_message_limit: null
+  deep_stream_message_limit: null
+  futures_enabled: false
+  warmup_min_trades: 3
+  snapshot_limit: 100
+  max_universe_symbols: 200
+
+api:
+  bind_host: "127.0.0.1"
+  bind_port: 8000
+  authentication_required: false
+  allowlist_cidrs: []

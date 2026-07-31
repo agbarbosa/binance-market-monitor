@@ -1,0 +1,15 @@
+services:
+  binance-market-monitor:
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    command:
+      - uv
+      - run
+      - binance-market-monitor
+      - monitor
+      - --config
+      - configs/config.example.yaml
+      - --serve-api

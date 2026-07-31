@@ -1,0 +1,7 @@
+name: binance-opportunities
+version: 0.1.0
+description: "Hermes tool that lists Binance Market Monitor opportunities from the local read-only API."
+author: Alexandre Barbosa
+kind: standalone
+provides_tools:
+  - binance_opportunities_list
